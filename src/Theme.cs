@@ -19,6 +19,14 @@ namespace AutovisorPanel
         public static readonly Color Err     = Color.FromArgb(220, 38, 38);
         public static readonly Color Soft    = Color.FromArgb(240, 242, 245);
 
+        // One shared scale for geometry, custom drawing and fonts.
+        internal static float ScaleFactor = 1f;
+
+        public static int Px(int logical)
+        {
+            return (int)Math.Round(logical * ScaleFactor);
+        }
+
         public static Font F(float size)
         {
             return F(size, FontStyle.Regular);
@@ -26,13 +34,13 @@ namespace AutovisorPanel
 
         public static Font F(float size, FontStyle style)
         {
-            return new Font("微软雅黑", size, style, GraphicsUnit.Point);
+            return new Font("微软雅黑", size * 96f / 72f * ScaleFactor, style, GraphicsUnit.Pixel);
         }
 
         public static GraphicsPath Round(Rectangle r, int radius)
         {
             GraphicsPath p = new GraphicsPath();
-            int d = radius * 2;
+            int d = Px(radius * 2);
             if (d <= 0 || d > r.Width || d > r.Height)
             {
                 p.AddRectangle(r);
@@ -51,6 +59,7 @@ namespace AutovisorPanel
     {
         public string Caption = "";
         public string SubCaption = "";
+        protected virtual int CaptionRightInset { get { return 18; } }
 
         public Card()
         {
@@ -74,12 +83,14 @@ namespace AutovisorPanel
                 using (Pen pen = new Pen(T.Line)) g.DrawPath(pen, path);
             }
 
-            TextRenderer.DrawText(g, Caption, T.F(11f, FontStyle.Bold),
-                new Point(18, 15), T.Text, TextFormatFlags.NoPadding);
+            using (Font title = T.F(11f, FontStyle.Bold))
+                TextRenderer.DrawText(g, Caption, title, new Rectangle(T.Px(18), T.Px(15), Math.Max(0, Width - T.Px(18 + CaptionRightInset)), T.Px(22)),
+                    T.Text, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
             if (SubCaption.Length > 0)
             {
-                TextRenderer.DrawText(g, SubCaption, T.F(8.5f),
-                    new Point(18, 40), T.Sub, TextFormatFlags.NoPadding);
+                using (Font subtitle = T.F(8.5f))
+                    TextRenderer.DrawText(g, SubCaption, subtitle, new Rectangle(T.Px(18), T.Px(40), Math.Max(0, Width - T.Px(36)), T.Px(20)),
+                        T.Sub, TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
             }
         }
     }
@@ -99,7 +110,7 @@ namespace AutovisorPanel
                      ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             FlatStyle = FlatStyle.Flat;
             FlatAppearance.BorderSize = 0;
-            Font = T.F(9.5f, FontStyle.Bold);
+            Font = T.F(10.5f, FontStyle.Bold);
             ForeColor = Color.White;
             Cursor = Cursors.Hand;
             Size = new Size(120, 38);
@@ -156,22 +167,23 @@ namespace AutovisorPanel
             Color c = hover ? T.Text : T.Sub;
             int cx = Width / 2;
             int cy = Height / 2;
-            int rx = 7;
-            int ry = 4;
+            int rx = T.Px(7);
+            int ry = T.Px(4);
 
-            using (Pen pen = new Pen(c, 1.4f))
+            using (Pen pen = new Pen(c, 1.4f * T.ScaleFactor))
             {
                 g.DrawEllipse(pen, cx - rx, cy - ry, rx * 2, ry * 2);
             }
             using (SolidBrush b = new SolidBrush(c))
             {
-                g.FillEllipse(b, cx - 2f, cy - 2f, 4f, 4f);
+                g.FillEllipse(b, cx - T.Px(2), cy - T.Px(2), T.Px(4), T.Px(4));
             }
             if (Hidden)
             {
-                using (Pen pen = new Pen(c, 1.6f))
+                using (Pen pen = new Pen(c, 1.6f * T.ScaleFactor))
                 {
-                    g.DrawLine(pen, cx - 6, cy + 6, cx + 6, cy - 6);
+                    int offset = T.Px(6);
+                    g.DrawLine(pen, cx - offset, cy + offset, cx + offset, cy - offset);
                 }
             }
         }
@@ -189,13 +201,13 @@ namespace AutovisorPanel
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
                      ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             BackColor = Color.White;
-            Height = 30;
+            Height = T.Px(30);
 
             Box.BorderStyle = BorderStyle.None;
-            Box.Font = T.F(9.5f);
+            Box.Font = T.F(10.5f);
             Box.BackColor = Color.White;
             Box.ForeColor = T.Text;
-            Box.Location = new Point(10, 6);
+            Box.Location = new Point(T.Px(10), T.Px(6));
             Controls.Add(Box);
 
             Box.GotFocus += delegate { focused = true; Invalidate(); };
@@ -219,12 +231,12 @@ namespace AutovisorPanel
         {
             if (eye != null) return;
 
-            reserved = 26;
+            reserved = T.Px(26);
             Box.PasswordChar = '*';
 
             eye = new EyeButton();
             eye.Hidden = true;
-            eye.Size = new Size(24, 22);
+            eye.Size = new Size(T.Px(24), T.Px(22));
             eye.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             eye.Click += delegate
             {
@@ -241,11 +253,11 @@ namespace AutovisorPanel
 
         private void LayoutBox()
         {
-            Box.Width = Width - 20 - reserved;
+            Box.Width = Math.Max(1, Width - T.Px(20) - reserved);
             Box.Top = (Height - Box.Height) / 2;
             if (eye != null)
             {
-                eye.Location = new Point(Width - 28, (Height - eye.Height) / 2);
+                eye.Location = new Point(Width - T.Px(28), (Height - eye.Height) / 2);
             }
         }
 
@@ -339,6 +351,7 @@ namespace AutovisorPanel
     internal class Bar : Control
     {
         private int val;
+        public Color FillColor = T.Accent;
 
         public Bar()
         {
@@ -366,7 +379,7 @@ namespace AutovisorPanel
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.Clear(Parent != null ? Parent.BackColor : T.Card);
 
-            int radius = Height / 2;
+            int radius = 3;
             Rectangle track = new Rectangle(0, 0, Width - 1, Height - 1);
             using (GraphicsPath p = T.Round(track, radius))
             using (SolidBrush b = new SolidBrush(T.Soft))
@@ -374,13 +387,12 @@ namespace AutovisorPanel
                 g.FillPath(b, p);
             }
 
-            int w = (int)((Width - 1) * val / 100.0);
+            int w = val > 0 && Width > 1 ? Math.Max(1, (int)((Width - 1) * val / 100.0)) : 0;
             if (w > 0)
             {
-                if (w < Height) w = Height;
                 Rectangle fill = new Rectangle(0, 0, w, Height - 1);
                 using (GraphicsPath p = T.Round(fill, radius))
-                using (SolidBrush b = new SolidBrush(T.Accent))
+                using (SolidBrush b = new SolidBrush(FillColor))
                 {
                     g.FillPath(b, p);
                 }
@@ -400,13 +412,14 @@ namespace AutovisorPanel
                      ControlStyles.UserPaint | ControlStyles.ResizeRedraw |
                      ControlStyles.SupportsTransparentBackColor, true);
             BackColor = Color.Transparent;
-            Font = T.F(9f, FontStyle.Bold);
+            Font = T.F(10f, FontStyle.Bold);
             Size = new Size(96, 26);
             DoubleBuffered = true;
         }
 
         public void Set(string text, Color fill, Color fg)
         {
+            if (Text == text && Fill == fill && TextColor == fg) return;
             Text = text;
             Fill = fill;
             TextColor = fg;

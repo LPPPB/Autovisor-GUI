@@ -2,7 +2,7 @@
 
 为 [Autovisor](https://github.com/CXRunfree/Autovisor) 做的第三方图形前端。
 把原本要手工编辑的 `config.ini` 搬进界面，密码改为 Windows DPAPI 加密保存，
-编译产物是 **31 KB 的单文件 EXE，零运行时依赖**。
+面板编译为单文件 EXE，使用 Windows 自带的 .NET Framework。
 
 > 本项目不是上游官方发行版。上游功能的实现与维护归 CXRunfree/Autovisor 所有，
 > 本项目只提供配置与运行控制的外壳，通过 `--config` 参数和日志文件与之交互。
@@ -14,7 +14,8 @@ AutovisorPanel/
 ├─ src/
 │  ├─ Program.cs        入口，单实例互斥
 │  ├─ Core.cs           Config / CredentialStore / LogReader / StudyRunner / GameGuard
-│  ├─ MainForm.cs       布局与交互
+│  ├─ MainForm.cs       界面状态、设置与运行控制
+│  ├─ MainForm.Layout.cs 导航和页面布局
 │  ├─ Theme.cs          设计令牌 + 自绘控件
 │  └─ app.manifest      DPI 感知、asInvoker
 ├─ runtime/             上游发行包（不入库，见 .gitignore）
@@ -37,10 +38,12 @@ AutovisorPanel/
 - 密码加密保存，`config.ini` 中不出现明文
 - 一键开始 / 停止刷课，按进程树结束浏览器子进程
 - 实时状态：当前课时、平台进度条、已完成节数、日志静默时长
+- 课程目录：从左侧导航打开，查看每章完成度、已完成标记和当前学习项
 - 日志预览自动滚动，异常时状态徽标变红并闪烁任务栏
 - 全屏游戏时自动暂停提醒，不打断游戏
 - 游戏检测：按 GPU 3D 占用识别游戏进程，自动暂停刷课并在游戏结束后恢复
-- 窗口可缩放，可最大化；两栏之间可拖拽分隔条，比例记入配置
+- 左侧切换学习概览、课程目录、课程设置和运行日志，顶部始终可操作开始和停止
+- 通知区和 Windows 提醒沿用面板图标。单击通知区图标打开面板，右键查看状态、启停或调整常用开关
 - 日志增量读取：只解析新增行，不重复扫描整个文件
 - 崩溃后可恢复：启动时清理上次遗留的临时配置
 
@@ -52,14 +55,15 @@ AutovisorPanel/
 |---|---|---|
 | 表现层 | 布局、绘制、事件 | `MainForm.cs`、`Theme.cs` |
 | 领域层 | 配置读写、凭据加解密、日志解析、进程控制、全屏检测 | `Core.cs` |
-| 边界 | 上游进程 + 日志文件 | 仅两个契约 |
+| 边界 | 上游进程、日志和课程目录 | 通过配置参数、日志和浏览器驱动读取 |
 
-**与上游的两个契约**
+**与上游的接口**
 
 1. 命令行 `Autovisor.exe --config <ini路径>` —— 用于注入一次性运行配置
 2. `<runtime>/logs/Log*.txt` 的文本格式 —— 用于解析课时与进度
+3. 随附 Playwright 1.59.1 驱动 —— 从面板启动学习时读取智慧树课程页已加载的目录和进度。目录视图只用于查看，上游驱动不兼容时仍可从日志查看运行状态。
 
-上游升级时只需调整 `LogReader` 里的正则，上游二进制不需要改动。
+更换上游版本时需验证启动参数、日志格式和浏览器驱动的兼容性。
 
 **上游定位规则**：优先使用 `runtime/Autovisor.exe`；若不存在，
 回退到面板同级的 `Autovisor.exe`。因此两种布局都能运行：
@@ -86,20 +90,21 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ## 打包分发
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\package.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File .\package.ps1 -UpstreamArchive .\Autovisor-3.18.4-windows-amd64.zip -Version 1.6.0
 ```
 
-产出 `dist\AutovisorPanel-1.0.0.zip`（约 38 MB），解压后的结构：
+脚本校验官方 [Autovisor 3.18.4 Windows AMD64 ZIP](https://github.com/CXRunfree/Autovisor/releases/tag/3.18.4) 的 SHA-256，并生成 `dist\AutovisorPanel-1.6.0.zip` 及其校验文件。解压后的结构：
 
 ```
 AutovisorPanel.exe
 config.ini          账号密码为空，首次运行填写
 使用说明.txt
+LICENSE.txt
+LICENSE.upstream.txt
 runtime/            上游发行包，勿单独移动
 ```
 
-打包会自动剔除 `logs/`、`packages/`、`data/cookies.json`、`data/cred.bin`，
-不会把你的凭据和日志发给别人。
+打包仅提取官方 ZIP 中的运行文件，并使用空白配置模板。工作区内的个人配置、Cookie、凭据、日志和依赖缓存不参与打包。
 
 ## 使用
 
@@ -148,7 +153,7 @@ runtime/            上游发行包，勿单独移动
 2026-11-09 14:05:34 | 已自动恢复刷课
 ```
 
-**开关**：配置卡「游戏时自动暂停」复选框，状态保存在 `config.ini` 的 `[panel]` 段（上游程序忽略该段）。
+**开关**：课程设置页的「游戏时暂停」复选框，状态保存在 `config.ini` 的 `[panel]` 段。
 
 > 无条件全屏（`QUNS_RUNNING_D3D_FULL_SCREEN`）仍作为辅助信号，用于抑制任务栏闪烁。
 
@@ -160,8 +165,8 @@ runtime/            上游发行包，勿单独移动
 - 自绘控件：圆角按钮（悬停仅变色不位移）、无边框输入框（聚焦变蓝边）、
   圆角进度条、胶囊状态徽标
 - 密码框默认星号，右侧自绘眼睛图标；点击切换明文，再次点击复原，焦点保持在输入框
-- 响应式：左侧配置栏宽度由分隔条决定，右侧状态栏随窗口拉伸；日志框与进度条同步变宽变高
-- 分隔把手为自绘控件（`GripBar`）：浅灰圆角竖条 + 三点，悬停变蓝，拖拽调整两栏比例
+- 字体和控件随 Windows 缩放，窗口默认大小受屏幕可用区域约束
+- 窄窗口中，设置页改为单列，内容可纵向滚动，顶部开始和停止按钮始终可用
 
 ## 性能
 
@@ -170,7 +175,7 @@ runtime/            上游发行包，勿单独移动
 | 状态刷新 | 3 秒一次，日志按追加偏移量增量解析，文件无变化时不产生 IO |
 | 日志预览 | 维护 40 行环形缓冲，只在有新行时更新文本框 |
 | GPU 检测 | 5 秒采样，性能计数器对象按实例缓存，退出进程的计数器自动回收 |
-| 拖拽重排 | 24ms 节流；内容面板双缓冲 + 拖拽期间暂停状态刷新，避免残影 |
+| 界面响应 | 日志、目录解析、GPU 采样和进程启停在后台执行，目录树和日志框仅在对应页面可见时更新 |
 | 界面重绘 | 提示文字等内容比对后才赋值，避免无效刷新 |
 | 内存 | 运行时工作集约 20~30 MB，无后台常驻进程 |
 
@@ -180,7 +185,7 @@ runtime/            上游发行包，勿单独移动
 - 上游只处理视频课时，PPT/PDF 章节需要手动切换
 - 课中弹题由上游自动选第一个选项，不保证正确
 - 检测依赖日志文本，平台改版后需同步调整解析正则
-- 打包体积由上游二进制决定（约 38 MB），面板本身仅 31 KB
+- 打包体积主要来自上游运行时（约 38 MiB）
 
 ## 免责声明
 

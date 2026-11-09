@@ -1,7 +1,8 @@
 ﻿#requires -version 5.1
 # 编译面板为单一 EXE（.NET Framework 4.8 内建，无需安装运行时）
 param(
-    [string]$OutFile = ''
+    [string]$OutFile = '',
+    [switch]$NoLocalCopy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +38,8 @@ $cscArgs = @(
     '/r:System.Drawing.dll'
     '/r:System.Windows.Forms.dll'
     '/r:System.Security.dll'
+    '/r:System.Web.Extensions.dll'
+    '/resource:' + (Join-Path $src 'catalog-capture.cjs') + ',AutovisorPanel.CatalogCapture'
 ) + $files
 
 Write-Host "编译 $($files.Count) 个源文件 -> $OutFile"
@@ -51,7 +54,7 @@ Write-Host ("编译成功: {0}  ({1:N0} 字节)" -f $info.Name, $info.Length)
 
 # 本地开发：runtime 目录就绪时，把 EXE 放到仓库根，可直接双击运行
 $localExe = Join-Path $here 'AutovisorPanel.exe'
-if ((Test-Path (Join-Path $here 'runtime\Autovisor.exe')) -and ($localExe -ne $OutFile)) {
+if (-not $NoLocalCopy -and (Test-Path (Join-Path $here 'runtime\Autovisor.exe')) -and ($localExe -ne $OutFile)) {
     try {
         Copy-Item -LiteralPath $OutFile -Destination $localExe -Force
         Write-Host ("已放置到仓库根: " + $localExe)

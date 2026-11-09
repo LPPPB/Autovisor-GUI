@@ -1,66 +1,86 @@
 ﻿#requires -version 5.1
-# 打包分发：面板 EXE + 上游 runtime 目录 -> 单个 zip
 param(
-    [string]$Version = '1.0.0',
-    [switch]$SkipBuild
+    [Parameter(Mandatory = $true)]
+    [string]$UpstreamArchive,
+    [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')]
+    [string]$Version = '1.6.0'
 )
 
 $ErrorActionPreference = 'Stop'
-
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$here = $PSScriptRoot
 $dist = Join-Path $here 'dist'
-$runtime = Join-Path $here 'runtime'
-$stage = Join-Path $dist 'stage'
+$stage = Join-Path $dist ('.stage-' + [guid]::NewGuid().ToString('N'))
+$zip = Join-Path $dist ("AutovisorPanel-{0}.zip" -f $Version)
+$upstreamSha256 = '11cea9e9ac1d9f122041cd82c7e6befcc891487396f16e82386f06cf2f8ea32d'
 
-if (-not $SkipBuild) {
-    & (Join-Path $here 'build.ps1')
+if ((Get-FileHash -LiteralPath $UpstreamArchive -Algorithm SHA256).Hash -ne $upstreamSha256) {
+    throw 'Expected the official Autovisor 3.18.4 Windows AMD64 ZIP with the pinned SHA-256.'
 }
+if (Test-Path -LiteralPath $zip) { throw "Archive already exists: $zip" }
 
-$panelExe = Join-Path $dist 'AutovisorPanel.exe'
-if (-not (Test-Path $panelExe)) { throw "未找到编译产物: $panelExe" }
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+New-Item -ItemType Directory -Path $stage -Force | Out-Null
+try {
+    $archive = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $UpstreamArchive).Path)
+    try {
+        $executables = @($archive.Entries | Where-Object { ($_.FullName -replace '\\', '/') -match '(^|/)Autovisor\.exe$' })
+        if ($executables.Count -ne 1) { throw 'Expected exactly one upstream Autovisor.exe.' }
+        $exeName = $executables[0].FullName -replace '\\', '/'
+        $prefix = $exeName.Substring(0, $exeName.Length - 'Autovisor.exe'.Length)
+        $fixedFiles = @('Autovisor.exe', 'resources/QRcode.jpg', 'resources/stealth.min.js', 'data/mirrors.json')
+        $runtimeDir = [IO.Path]::GetFullPath((Join-Path $stage 'runtime'))
+        $runtimePrefix = $runtimeDir + [IO.Path]::DirectorySeparatorChar
 
-if (-not (Test-Path (Join-Path $runtime 'Autovisor.exe'))) {
-    throw "runtime 目录不完整，请把上游发行包解压到 $runtime"
+        foreach ($entry in $archive.Entries) {
+            $name = $entry.FullName -replace '\\', '/'
+            if (!$name.StartsWith($prefix, [StringComparison]::Ordinal) -or $name.EndsWith('/')) { continue }
+            $relative = $name.Substring($prefix.Length)
+            if ($relative -notin $fixedFiles -and !$relative.StartsWith('internal/', [StringComparison]::Ordinal)) { continue }
+
+            # Certifi ships a public CA bundle. Every other credential-shaped runtime file is rejected.
+            if ($relative -ne 'internal/certifi/cacert.pem' -and $relative -match '(?i)(^|/)(?:\.env(?:\.[^/]+)?|logs?|packages|cookies?\.(?:json|txt)|cred\.bin|credentials?(?:\.[^/]+)?|config\.ini|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:log|key|pfx|p12|pem))$') {
+                throw "Unexpected runtime entry: $relative"
+            }
+            if ($relative -match '(^|/)\.\.?(/|$)|:') { throw "Invalid runtime entry: $relative" }
+            $target = [IO.Path]::GetFullPath((Join-Path $runtimeDir $relative))
+            if (!$target.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Runtime entry escapes the staging directory: $relative"
+            }
+            New-Item -ItemType Directory -Path ([IO.Path]::GetDirectoryName($target)) -Force | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target)
+        }
+        foreach ($required in $fixedFiles + 'internal/playwright/driver/node.exe') {
+            if (!(Test-Path -LiteralPath (Join-Path $runtimeDir $required) -PathType Leaf)) {
+                throw "Missing required runtime file: $required"
+            }
+        }
+    }
+    finally { $archive.Dispose() }
+
+    $template = Join-Path $here 'config.template.ini'
+    $ini = Get-Content -LiteralPath $template -Raw -Encoding UTF8
+    if ($ini -match '(?im)^[ \t]*(?:username|password|URL[0-9]+)[ \t]*=[ \t]*\S' -or
+        $ini -notmatch '(?im)^username[ \t]*=[ \t]*\r?$' -or
+        $ini -notmatch '(?im)^password[ \t]*=[ \t]*\r?$') {
+        throw 'Distribution configuration must have blank account, password and course entries.'
+    }
+    Copy-Item -LiteralPath $template -Destination (Join-Path $stage 'config.ini')
+    Copy-Item -LiteralPath (Join-Path $here '使用说明.txt') -Destination $stage
+    Copy-Item -LiteralPath (Join-Path $here 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt')
+    Copy-Item -LiteralPath (Join-Path $here 'LICENSE.upstream.txt') -Destination $stage
+    & (Join-Path $here 'build.ps1') -OutFile (Join-Path $stage 'AutovisorPanel.exe') -NoLocalCopy
+
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath ($zip + '.sha256') -Encoding Ascii -Value ($hash + '  ' + [IO.Path]::GetFileName($zip))
+    Write-Host "Package: $zip"
+    Write-Host "SHA-256: $hash"
 }
-foreach ($need in 'internal', 'resources', 'data') {
-    if (-not (Test-Path (Join-Path $runtime $need))) {
-        throw "runtime 缺少 $need 目录"
+finally {
+    $resolvedStage = (Resolve-Path -LiteralPath $stage).Path
+    $resolvedDist = (Resolve-Path -LiteralPath $dist).Path
+    if ($resolvedStage.StartsWith($resolvedDist + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -and
+        [IO.Path]::GetFileName($resolvedStage).StartsWith('.stage-', [StringComparison]::Ordinal)) {
+        Remove-Item -LiteralPath $resolvedStage -Recurse -Force
     }
 }
-
-if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
-New-Item -ItemType Directory -Path $stage -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $stage 'runtime') -Force | Out-Null
-
-# 1. 面板
-Copy-Item -LiteralPath $panelExe -Destination $stage -Force
-
-# 2. 配置模板
-$tpl = Join-Path $here 'config.template.ini'
-if (Test-Path $tpl) {
-    Copy-Item -LiteralPath $tpl -Destination (Join-Path $stage 'config.ini') -Force
-}
-
-# 3. 上游 runtime（排除日志、依赖缓存、凭据）
-$excluded = @('logs', 'packages')
-Get-ChildItem -LiteralPath $runtime -Force | Where-Object { $excluded -notcontains $_.Name } | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $stage 'runtime') -Recurse -Force
-}
-foreach ($bad in 'data\cookies.json', 'data\cred.bin') {
-    $p = Join-Path $stage ('runtime\' + $bad)
-    if (Test-Path $p) { Remove-Item -LiteralPath $p -Force }
-}
-
-# 4. 说明文档与许可证
-$doc = Join-Path $here '使用说明.txt'
-if (-not (Test-Path $doc)) { throw "缺少 使用说明.txt" }
-Copy-Item -LiteralPath $doc -Destination $stage -Force
-Copy-Item -LiteralPath (Join-Path $here 'LICENSE') -Destination (Join-Path $stage 'LICENSE.txt') -Force
-# 5. 压缩
-$zip = Join-Path $dist ("AutovisorPanel-{0}.zip" -f $Version)
-if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
-Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
-Remove-Item -LiteralPath $stage -Recurse -Force
-
-$info = Get-Item -LiteralPath $zip
-Write-Host ("打包完成: {0}  ({1:N1} MB)" -f $info.Name, ($info.Length / 1MB))

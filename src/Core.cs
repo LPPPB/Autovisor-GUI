@@ -158,6 +158,37 @@ namespace AutovisorPanel
             Save(path, null);
         }
 
+        public static void SaveSwitch(string path, string section, string key, bool enabled)
+        {
+            List<string> lines = File.Exists(path)
+                ? new List<string>(File.ReadAllLines(path, Encoding.UTF8)) : new List<string>();
+            int sectionEnd = -1;
+            int option = -1;
+            bool inside = false;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                string line = lines[i].Trim();
+                if (line.StartsWith("[") && line.EndsWith("]"))
+                    inside = line.Substring(1, line.Length - 2).Trim() == section;
+                if (!inside) continue;
+                sectionEnd = i + 1;
+                int eq = line.IndexOf('=');
+                if (eq > 0 && line.Substring(0, eq).Trim() == key) option = i;
+            }
+
+            string value = key + " = " + (enabled ? "True" : "False");
+            if (option >= 0) lines[option] = value;
+            else if (sectionEnd >= 0) lines.Insert(sectionEnd, value);
+            else
+            {
+                if (lines.Count > 0 && lines[lines.Count - 1].Length > 0) lines.Add("");
+                lines.Add("[" + section + "]");
+                lines.Add(value);
+            }
+
+            File.WriteAllLines(path, lines, new UTF8Encoding(false));
+        }
+
         // password 传 null 表示不写入密码（面板常态）
         public void Save(string path, string passwordForRun)
         {
@@ -219,9 +250,12 @@ namespace AutovisorPanel
     internal class StudySnapshot
     {
         public bool Running;
+        public string CourseTitle = "";
         public string LessonText = "—";
         public int Progress = -1;
-        public int Done;
+        public int PlayerSeconds = -1;
+        public int DurationSeconds = -1;
+        public int Done = -1;
         public int Total;
         public string UpdatedText = "—";
         public double IdleMinutes = -1;
@@ -229,23 +263,58 @@ namespace AutovisorPanel
         public string AttentionText = "";
         public string Tail = "";
         public string LogFile = "";
+        public CourseCatalog Catalog;
+        public LearningOverview Overview;
     }
 
     // 增量读取日志：首轮读全量，之后只读新增部分，避免每 3 秒重复解析整个文件
     internal class LogTail
     {
-        private static readonly Regex LessonStart = new Regex(@"课时开始 \| 序号=(\d+)/(\d+) 标题=(.+?) 平台进度=(\d+)%");
-        private static readonly Regex PlayState = new Regex(@"播放状态 \| 已学=(\d+(?:\.\d+)?)min 平台进度=(\d+)%");
-        private static readonly Regex DoneResult = new Regex(@"课时结果 \| 序号=\d+/\d+ .*?完成=True");
+        private static readonly Regex CatalogCount = new Regex(@"Get to-learn class: ([0-9]{1,9}) / ([0-9]{1,9})\s*$");
+        private static readonly Regex CourseName = new Regex(@"当前课程 \| 名称=(.+)$|当前课程:<<(.+?)>>");
+        private static readonly Regex LessonStart = new Regex(@"课时开始 \| 序号=([0-9]+/[0-9]+) 标题=(.+) 平台进度=([0-9]{1,3})%");
+        private static readonly Regex LessonResult = new Regex(@"课时结果 \| 序号=([0-9]+/[0-9]+) (.*)");
+        private static readonly Regex PlatformProgress = new Regex(@" 平台进度=([0-9]{1,3})%(?=\s|$)");
+        private static readonly Regex PlayerTime = new Regex(@" 播放器=([0-9]{1,9})s 总时长=([0-9]{1,9})s(?=\s|$)");
+        private static readonly Regex LegacyCompletion = new Regex(@"(?:^| )完成=True(?:\s|$)");
 
         private string filePath = "";
         private long offset;
-        private int doneCount;
+        private readonly HashSet<string> completed = new HashSet<string>();
+        private int doneAtStart = -1;
         private int total;
+        private string courseTitle = "";
+        private string lessonPosition = "";
         private string lessonText = "—";
         private int progress = -1;
+        private int playerSeconds = -1;
+        private int durationSeconds = -1;
         private bool verifyPending;
         private readonly Queue<string> tail = new Queue<string>();
+        private readonly Func<DateTime> utcNow;
+        private DateTime? runStartedUtc;
+        private DateTime lastActivityUtc;
+
+        public const double StuckMinutes = 10;
+
+        public LogTail(Func<DateTime> utcNow = null)
+        {
+            this.utcNow = utcNow ?? (() => DateTime.UtcNow);
+        }
+
+        public void StartRun(DateTime startedUtc)
+        {
+            runStartedUtc = startedUtc;
+            lastActivityUtc = startedUtc;
+            verifyPending = false;
+        }
+
+        private void EndRun()
+        {
+            runStartedUtc = null;
+            lastActivityUtc = DateTime.MinValue;
+            verifyPending = false;
+        }
 
         public static string FindLatest(string logsDir)
         {
@@ -257,7 +326,7 @@ namespace AutovisorPanel
             DateTime bestTime = DateTime.MinValue;
             foreach (string f in files)
             {
-                DateTime t = File.GetLastWriteTime(f);
+                DateTime t = File.GetLastWriteTimeUtc(f);
                 if (t > bestTime) { bestTime = t; best = f; }
             }
             return best;
@@ -266,21 +335,38 @@ namespace AutovisorPanel
         private void Reset()
         {
             offset = 0;
-            doneCount = 0;
+            ResetCourse();
+            tail.Clear();
+        }
+
+        private void ResetCourse()
+        {
+            completed.Clear();
+            doneAtStart = -1;
             total = 0;
+            courseTitle = "";
+            lessonPosition = "";
             lessonText = "—";
             progress = -1;
+            playerSeconds = -1;
+            durationSeconds = -1;
             verifyPending = false;
-            tail.Clear();
         }
 
         public StudySnapshot Poll(string logsDir, bool running)
         {
             StudySnapshot s = new StudySnapshot();
             s.Running = running;
+            DateTime now = utcNow();
+            if (!running) EndRun();
+            else if (!runStartedUtc.HasValue) StartRun(now);
 
             string latest = FindLatest(logsDir);
-            if (latest == null) return s;
+            if (latest == null)
+            {
+                UpdateSilence(s, now, null);
+                return s;
+            }
             s.LogFile = latest;
 
             if (latest != filePath)
@@ -295,31 +381,44 @@ namespace AutovisorPanel
             }
             catch
             {
+                UpdateSilence(s, now, null);
                 return s;
             }
 
             s.LessonText = lessonText;
+            s.CourseTitle = courseTitle;
             s.Total = total;
-            s.Done = doneCount;
+            s.Done = doneAtStart < 0 ? -1 : doneAtStart + Math.Min(completed.Count, total - doneAtStart);
             s.Progress = progress;
+            s.PlayerSeconds = playerSeconds;
+            s.DurationSeconds = durationSeconds;
 
-            DateTime wrote = File.GetLastWriteTime(filePath);
-            s.UpdatedText = wrote.ToString("HH:mm:ss");
-            s.IdleMinutes = Math.Round((DateTime.Now - wrote).TotalMinutes, 1);
+            DateTime wrote = File.GetLastWriteTimeUtc(filePath);
+            s.UpdatedText = wrote.ToLocalTime().ToString("HH:mm:ss");
+            UpdateSilence(s, now, wrote);
+            s.Tail = string.Join(Environment.NewLine, tail.ToArray());
+            return s;
+        }
 
-            if (verifyPending)
+        private void UpdateSilence(StudySnapshot s, DateTime now, DateTime? wrote)
+        {
+            if (!runStartedUtc.HasValue) return;
+
+            bool fromCurrentRun = wrote.HasValue && wrote.Value >= runStartedUtc.Value;
+            if (fromCurrentRun && wrote.Value > lastActivityUtc)
+                lastActivityUtc = wrote.Value;
+            s.IdleMinutes = Math.Max(0, (now - lastActivityUtc).TotalMinutes);
+
+            if (fromCurrentRun && verifyPending)
             {
                 s.NeedAttention = true;
                 s.AttentionText = "检测到安全验证，需要人工处理";
             }
-            else if (running && s.IdleMinutes > 10)
+            else if (s.IdleMinutes >= StuckMinutes)
             {
                 s.NeedAttention = true;
-                s.AttentionText = "日志已静默 " + s.IdleMinutes + " 分钟，可能卡住";
+                s.AttentionText = "日志已静默 " + s.IdleMinutes.ToString("0.#") + " 分钟，可能暂停或等待验证";
             }
-
-            s.Tail = string.Join(Environment.NewLine, tail.ToArray());
-            return s;
         }
 
         private void ReadAppend()
@@ -346,41 +445,105 @@ namespace AutovisorPanel
 
                 string chunk = Encoding.UTF8.GetString(buffer, 0, lastBreak);
                 offset += lastBreak + 1;
-                Consume(chunk.Replace("\r\n", "\n").Split('\n'));
+                bool fromCurrentRun = runStartedUtc.HasValue && File.GetLastWriteTimeUtc(filePath) >= runStartedUtc.Value;
+                Consume(chunk.Replace("\r\n", "\n").Split('\n'), fromCurrentRun);
             }
         }
 
-        private void Consume(string[] lines)
+        private void Consume(string[] lines, bool fromCurrentRun)
         {
             foreach (string line in lines)
             {
                 if (line.Length == 0) continue;
 
-                Match m = LessonStart.Match(line);
-                if (m.Success)
+                ConsumeProgress(line);
+
+                if (fromCurrentRun)
                 {
-                    total = int.Parse(m.Groups[2].Value);
-                    lessonText = "第 " + m.Groups[1].Value + "/" + m.Groups[2].Value + " 节  " + m.Groups[3].Value.Trim();
+                    if (line.IndexOf("检测到安全验证", StringComparison.Ordinal) >= 0) verifyPending = true;
+                    if (line.IndexOf("安全验证已完成", StringComparison.Ordinal) >= 0) verifyPending = false;
                 }
-
-                m = PlayState.Match(line);
-                if (m.Success)
-                {
-                    progress = int.Parse(m.Groups[2].Value);
-                }
-
-                if (line.IndexOf("课时完成 | 平台进度=100%", StringComparison.Ordinal) >= 0)
-                {
-                    progress = 100;
-                }
-
-                if (DoneResult.IsMatch(line)) doneCount++;
-
-                if (line.IndexOf("检测到安全验证", StringComparison.Ordinal) >= 0) verifyPending = true;
-                if (line.IndexOf("安全验证已完成", StringComparison.Ordinal) >= 0) verifyPending = false;
 
                 tail.Enqueue(line);
                 while (tail.Count > 40) tail.Dequeue();
+            }
+        }
+
+        private static int ReadPercent(Match match)
+        {
+            if (!match.Success) return -1;
+            int value = int.Parse(match.Groups[1].Value);
+            return value <= 100 ? value : -1;
+        }
+
+        private void ConsumeProgress(string line)
+        {
+            if (line.IndexOf("课程目录 | 类型=", StringComparison.Ordinal) >= 0 ||
+                line.IndexOf("运行环境 | 版本=", StringComparison.Ordinal) >= 0)
+            {
+                ResetCourse();
+                return;
+            }
+
+            Match name = CourseName.Match(line);
+            if (name.Success)
+            {
+                courseTitle = (name.Groups[1].Success ? name.Groups[1].Value : name.Groups[2].Value).Trim();
+                return;
+            }
+
+            Match catalog = CatalogCount.Match(line);
+            if (catalog.Success)
+            {
+                int remaining = int.Parse(catalog.Groups[1].Value);
+                int count = int.Parse(catalog.Groups[2].Value);
+                if (remaining <= count)
+                {
+                    total = count;
+                    doneAtStart = total - remaining;
+                    completed.Clear();
+                }
+                return;
+            }
+
+            Match start = LessonStart.Match(line);
+            if (start.Success)
+            {
+                lessonPosition = start.Groups[1].Value;
+                lessonText = start.Groups[2].Value.Trim();
+                int value = int.Parse(start.Groups[3].Value);
+                progress = value <= 100 ? value : -1;
+                playerSeconds = -1;
+                durationSeconds = -1;
+                return;
+            }
+
+            Match result = LessonResult.Match(line);
+            if (result.Success)
+            {
+                string position = result.Groups[1].Value;
+                string fields = " " + result.Groups[2].Value;
+                int value = ReadPercent(PlatformProgress.Match(fields));
+                if (value == 100 || (value < 0 && LegacyCompletion.IsMatch(fields)))
+                    completed.Add(position);
+                if (position == lessonPosition && value >= 0) progress = value;
+                return;
+            }
+
+            if (lessonPosition.Length == 0) return;
+            bool playback = line.IndexOf("播放状态 |", StringComparison.Ordinal) >= 0;
+            if (!playback && line.IndexOf("课时完成 |", StringComparison.Ordinal) < 0 &&
+                line.IndexOf("上报重试 |", StringComparison.Ordinal) < 0) return;
+
+            int percent = ReadPercent(PlatformProgress.Match(line));
+            if (percent >= 0) progress = percent;
+            if (percent == 100) completed.Add(lessonPosition);
+
+            Match time = playback ? PlayerTime.Match(line) : Match.Empty;
+            if (time.Success)
+            {
+                playerSeconds = int.Parse(time.Groups[1].Value);
+                durationSeconds = int.Parse(time.Groups[2].Value);
             }
         }
     }
@@ -414,6 +577,7 @@ namespace AutovisorPanel
         private string tempConfig;
 
         private readonly LogTail logTail = new LogTail();
+        private readonly CatalogCapture catalogCapture = new CatalogCapture();
 
         public StudyRunner(string root)
         {
@@ -468,13 +632,17 @@ namespace AutovisorPanel
             psi.Arguments = "--config \"" + tempConfig + "\"";
             psi.WorkingDirectory = runtimeDir;
             psi.UseShellExecute = true;
+            catalogCapture.Prepare(psi, runtimeDir);
 
             try
             {
+                DateTime startedUtc = DateTime.UtcNow;
                 proc = Process.Start(psi);
+                logTail.StartRun(startedUtc);
             }
             catch (Exception ex)
             {
+                catalogCapture.Close();
                 return "启动失败：" + ex.Message;
             }
             return null;
@@ -529,11 +697,32 @@ namespace AutovisorPanel
             }
             catch { }
             PurgeTempConfig();
+            catalogCapture.Close();
+        }
+
+        public void CloseCatalog()
+        {
+            catalogCapture.Close();
         }
 
         public StudySnapshot Snapshot()
         {
-            return logTail.Poll(logsDir, IsRunning);
+            StudySnapshot snapshot = logTail.Poll(logsDir, IsRunning);
+            snapshot.Catalog = catalogCapture.Read();
+            if (snapshot.Running && snapshot.Catalog != null && snapshot.Catalog.Lessons != null)
+            {
+                foreach (CatalogLesson lesson in snapshot.Catalog.Lessons)
+                {
+                    if (lesson == null || !lesson.Current) continue;
+                    snapshot.LessonText = string.IsNullOrEmpty(lesson.Number)
+                        ? lesson.Title : lesson.Number + " " + lesson.Title;
+                    if (lesson.Progress >= 0 && lesson.Progress <= 100)
+                        snapshot.Progress = lesson.Progress;
+                    break;
+                }
+            }
+            snapshot.Overview = LearningOverview.From(snapshot);
+            return snapshot;
         }
     }
 }

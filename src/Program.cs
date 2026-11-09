@@ -1,4 +1,5 @@
 using System;
+using System.Drawing;
 using System.IO;
 using System.Threading;
 using System.Windows.Forms;
@@ -19,6 +20,8 @@ namespace AutovisorPanel
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            using (Graphics screen = Graphics.FromHwnd(IntPtr.Zero))
+                T.ScaleFactor = screen.DpiX / 96f;
 
             string root = Path.GetDirectoryName(Application.ExecutablePath);
 

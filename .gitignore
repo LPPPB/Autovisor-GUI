@@ -16,12 +16,16 @@ packages/
 
 # 运行期数据：日志与凭据，绝不入库
 logs/
-data/cred.bin
-data/cookies.json
+/data/
 *.log
 
 # 本地配置（含账号信息）
 config.ini
+.env
+.env.*
+*.key
+*.p12
+*.pfx
 
 # 编辑器 / IDE
 .vs/

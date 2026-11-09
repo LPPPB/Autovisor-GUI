@@ -1,0 +1,110 @@
+﻿name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 编译面板
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 检查编译环境
+        shell: pwsh
+        run: |
+          $csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+          if (-not (Test-Path $csc)) { throw '未找到 csc.exe' }
+          & $csc /? | Select-Object -First 1
+
+      - name: 编译
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'dist\AutovisorPanel.exe'
+          if (-not (Test-Path $exe)) { throw '编译产物不存在' }
+          $item = Get-Item $exe
+          if ($item.Length -lt 10240) { throw "产物过小: $($item.Length) 字节" }
+          Write-Host ("产物: {0}  {1:N0} 字节" -f $item.Name, $item.Length)
+          Get-FileHash $exe -Algorithm SHA256 | Select-Object Hash
+
+      - name: 上传面板
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutovisorPanel-${{ github.sha }}
+          path: dist/AutovisorPanel.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: 打包分发 zip
+    needs: build
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 获取上游发行包
+        shell: pwsh
+        run: |
+          $api = 'https://api.github.com/repos/CXRunfree/Autovisor/releases/latest'
+          $release = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'AutovisorPanel-CI' }
+          $asset = $release.assets | Where-Object { $_.name -like '*windows-amd64*.zip' } | Select-Object -First 1
+          if (-not $asset) { throw '上游未找到 windows-amd64 zip 资产' }
+          Write-Host ("上游版本: {0}" -f $release.tag_name)
+          Write-Host ("下载: {0}" -f $asset.name)
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile upstream.zip -UseBasicParsing
+          Expand-Archive -LiteralPath upstream.zip -DestinationPath unpack -Force
+          $exe = Get-ChildItem unpack -Recurse -Filter 'Autovisor.exe' | Select-Object -First 1
+          if (-not $exe) { throw '解压后未找到 Autovisor.exe' }
+          $src = $exe.Directory.FullName
+          Remove-Item runtime -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path runtime -Force | Out-Null
+          Copy-Item (Join-Path $src '*') -Destination runtime -Recurse -Force
+
+      - name: 打包
+        shell: pwsh
+        run: |
+          $ver = if ('${{ github.event_name }}' -eq 'release') { '${{ github.event.release.tag_name }}' } else { '{0}' -f (Get-Date -Format 'yyyyMMdd') }
+          $ver = $ver -replace '^v', ''
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\package.ps1 -Version $ver
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist\*.zip | Select-Object Name, Length
+
+      - name: 上传分发包
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutovisorPanel-dist
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 附加到 Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          fail_on_unmatched_files: true
